@@ -1,0 +1,221 @@
+
+/* HELPERS */
+
+// KMeans on inputImg on roi into k clusters (training done on samples)
+function getKClusters(inputImg, samples, roi, k) {
+  k = ee.Number(k);
+  var clusterer = ee.Clusterer.wekaKMeans(k).train({
+    features: samples,
+    inputProperties: inputImg.bandNames()
+  });
+  return inputImg.cluster(clusterer).rename('cluster').clip(roi.geometry());
+}
+
+// Smoothen a list of values using moving average
+function movingAverage(list, windowSize) {
+  list = ee.List(list);
+  var n = list.size();
+  var half = ee.Number(windowSize).divide(2).floor();
+
+  var smoothed = ee.List.sequence(0, n.subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    var start = i.subtract(half).max(0);
+    var end = i.add(half).min(n.subtract(1));
+
+    var subset = list.slice(start, end.add(1));
+    var mean = ee.Number(subset.reduce(ee.Reducer.mean()));
+    return mean;
+  });
+
+  return ee.List(smoothed);
+}
+
+// Takes two arrays and computes derivative; expects xVals to be evenly spaced
+function discreteDeriv(yVals, xVals) {
+  yVals = ee.List(yVals); 
+  xVals = ee.List(xVals); 
+  var dx = ee.Number(xVals.get(1)).subtract(ee.Number(xVals.get(0))); 
+  var dy = yVals.slice(1).zip(yVals).map(function(p) { 
+    p = ee.List(p); 
+    return ee.Number(p.get(0)).subtract(ee.Number(p.get(1))); 
+  }); 
+  var dydx = dy.map(function(d) { 
+    return ee.Number(d).divide(dx); 
+  }); 
+  return ee.List(dydx); 
+  
+}
+
+
+// For each k in (kMin, kMax), computes the Within Cluster Sum of Squares
+// Returns dictionary with list of ks and list of WCSS values
+function getWcssDict(inputImg, roi, scale, kMin, kMax) {
+
+  // Expects global variables - roi, samples
+  function computeWCSS(k) {
+    var clustered = getKClusters(inputImg, samples, roi, k);
+    // WCSS should be calculated on a new sample set, not the training set
+    var evalSamples = inputImg.addBands(clustered).sample({
+      region: roi.geometry(),
+      scale: scale,
+      numPixels: 5000,
+      seed: 99,
+      geometries: false
+    });
+    var clusterIds = ee.List(evalSamples.aggregate_array('cluster')).distinct().sort();
+  
+    // Convert cluster id numbers to string for dictionary
+    var keys = clusterIds.map(function(ci) {
+      return ee.String(ee.Number(ci).format());
+    });
+    var bandNames = inputImg.bandNames();
+    
+    // For each cluster, get a list of means (centroids) over each band
+    var values = clusterIds.map(function(ci) {
+      var cid = ee.Number(ci);
+      var fc = evalSamples.filter(ee.Filter.eq('cluster', cid));
+      var n = fc.size();
+    
+      var meansList = ee.List(fc.reduceColumns(
+        ee.Reducer.mean().repeat(bandNames.size()), bandNames
+      ).get('mean'));
+      return ee.Dictionary.fromLists(bandNames, ee.List(meansList));
+    });
+    
+    // Mapping from cluster id to list of band centroids
+    var clusterMeansDict = ee.Dictionary.fromLists(keys, values);
+    
+    // For each point in evalSamples, get Squared Sum of error over bands
+    var evalWithSqSum = evalSamples.map(function(f) {
+      var clusterId = ee.Number(f.get('cluster'));
+      var clusterKey = clusterId.format();
+    
+      var clusterMeans = ee.Dictionary(clusterMeansDict.get(clusterKey));
+      
+      // For each band, get the variance^2
+      var sqDiffs = bandNames.map(function(b) {
+        b = ee.String(b);
+        var x = ee.Number(f.get(b));
+        var mu = ee.Number(clusterMeans.get(b));
+        return x.subtract(mu).pow(2);
+      });
+      
+      // Sum these squared variances
+      var sqSum = ee.List(sqDiffs).reduce(ee.Reducer.sum());
+      sqSum = ee.Number(sqSum);
+    
+      return ee.Feature(null, {
+        squared_sum: sqSum,
+        cluster: clusterId
+      });
+    });
+    
+    // Sum over all points in evalSamples to get WCSS
+    var wcss = evalWithSqSum.aggregate_sum('squared_sum');
+    return wcss;
+  
+  }
+
+  inputImg = inputImg.clip(roi.geometry());
+  var samples = inputImg.sample({
+    region: roi.geometry(),
+    scale: scale,
+    geometries: false,
+    numPixels: 5000,
+    seed: 42
+  });
+  
+  var ks = ee.List.sequence(kMin, kMax);
+  var wcssList = ks.map(computeWCSS);
+  // Smoothen WCSS with a 3-window
+  wcssList = movingAverage(wcssList, 3);
+  
+  return ee.Dictionary({
+    'ks' : ks,
+    'wcss' : wcssList,
+  });
+}
+
+// Computes point of maximum curvature (maxima of second derivative)
+// Optionally prints WCSS, first deriv., second deriv. graphs
+function getMaxCurvature(wcssDict, printCharts) {
+  printCharts = ((printCharts === undefined) ? false : printCharts);
+  wcssDict = ee.Dictionary(wcssDict);
+
+  var ks = ee.List(wcssDict.get('ks'));
+  var wcssList = ee.List(wcssDict.get('wcss'));
+
+  var d1x = ks.slice(0,-1);
+  var d1y = discreteDeriv(wcssList, ks);
+
+  var d2x = d1x.slice(0,-1);
+  var d2y = discreteDeriv(d1y, d1x);
+
+  var maxIndex = d2y.indexOf(d2y.reduce(ee.Reducer.max()));
+  // Adjusting by 1 to align indices
+  // Since forward derivatives are being calculated
+  var bestK = ee.Number(d2x.get(maxIndex)).add(1);
+
+  if (printCharts) {
+    // WCSS vs K
+    var chart1 = ui.Chart.array.values(wcssList, 0, ks)
+      .setOptions({
+        title: 'WCSS vs K',
+        hAxis: {title: 'K'},
+        vAxis: {title: 'WCSS'},
+        lineWidth: 2,
+        pointSize: 4
+      });
+  
+    // First Derivative
+    var chart2 = ui.Chart.array.values(d1y, 0, d1x)
+      .setOptions({
+        title: 'First Derivative',
+        hAxis: {title: 'K'},
+        vAxis: {title: 'First Derivative'},
+        lineWidth: 2,
+        pointSize: 4
+      });
+  
+    // Second Derivative
+    var chart3 = ui.Chart.array.values(d2y, 0, d2x)
+      .setOptions({
+        title: 'Second Derivative (Curvature)',
+        hAxis: {title: 'K'},
+        vAxis: {title: 'Second Derivative'},
+        lineWidth: 2,
+        pointSize: 4
+      });
+  
+    print(chart1);
+    print(chart2);
+    print(chart3);
+    
+    print('Elbow (max curvature) K =', bestK);
+  }
+  
+  return bestK;
+}
+
+
+/* API */
+
+// Returns KMeans clustered image
+exports.kMeansClusters = function(inputImg, roi, scale, k) {
+  var samples = inputImg.sample({
+    region: roi.geometry(),
+    scale: scale,
+    geometries: false,
+    numPixels: 5000,
+    seed: 42
+  });
+  return getKClusters(inputImg, samples, roi, k);
+}
+
+// Returns K in (kMin, kMax) for which curvature of WCSS is max, aka 'elbow point'
+exports.elbowPointK = function(inputImg, roi, scale, kMin, kMax, printCharts) {
+  printCharts = ((printCharts === undefined) ? false : printCharts);
+
+  var wcssDict = getWcssDict(inputImg, roi, scale, kMin, kMax);
+  return getMaxCurvature(wcssDict, printCharts);
+}
